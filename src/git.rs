@@ -1,5 +1,7 @@
 use crate::error::{ArboristError, Result};
 use duct::cmd;
+use sha2::{Digest, Sha256};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 // Helper function to run git commands and return stdout
@@ -25,6 +27,42 @@ fn path_to_string(path: &Path) -> Result<String> {
             ArboristError::InvalidPath(format!("Path contains non-UTF8 characters: {:?}", path))
         })
         .map(|s| s.to_string())
+}
+
+/// Computes the worktree path for a non-bare repository
+/// Returns: /tmp/arborist/{sha256_hash}/{color}
+pub fn compute_nonbare_worktree_path(repo_root: &Path, color: &str) -> Result<PathBuf> {
+    let repo_path_str = path_to_string(repo_root)?;
+    let mut hasher = Sha256::new();
+    hasher.update(repo_path_str.as_bytes());
+    let hash = hasher.finalize();
+    let hash_hex = format!("{:x}", hash);
+
+    let path = PathBuf::from("/tmp")
+        .join("arborist")
+        .join(hash_hex)
+        .join(color);
+
+    Ok(path)
+}
+
+/// Ensures the base directory for a worktree path exists
+fn ensure_worktree_base_dir(worktree_path: &Path) -> Result<()> {
+    if let Some(parent) = worktree_path.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent).map_err(|e| {
+                ArboristError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "Failed to create worktree base directory {}: {}",
+                        parent.display(),
+                        e
+                    ),
+                ))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +169,14 @@ pub fn create_worktree(
     commit: &str,
     upstream_branch: Option<&str>,
 ) -> Result<()> {
+    // Ensure base directory exists (for non-bare repos in /tmp)
+    ensure_worktree_base_dir(path)?;
+
+    // If worktree already exists, skip creation
+    if worktree_exists(path)? {
+        return Ok(());
+    }
+
     let path_str = path_to_string(path)?;
     let output = cmd!("git", "worktree", "add", "-b", branch, &path_str, commit)
         .stderr_capture()
@@ -226,24 +272,6 @@ fn get_commits_ahead() -> Result<usize> {
         }
         Err(_) => Ok(0), // No upstream = 0 ahead (intentional, not an error)
     }
-}
-
-// Branch operations
-pub fn branch_exists(branch: &str) -> Result<bool> {
-    match run_git_cmd(&["rev-parse", "--verify", branch]) {
-        Ok(_) => Ok(true),
-        Err(_) => Ok(false),
-    }
-}
-
-pub fn create_branch(branch: &str, commit: &str) -> Result<()> {
-    run_git_cmd(&["checkout", "-b", branch, commit])?;
-    Ok(())
-}
-
-pub fn checkout_branch(branch: &str) -> Result<()> {
-    run_git_cmd(&["checkout", branch])?;
-    Ok(())
 }
 
 pub fn delete_branch(branch: &str) -> Result<()> {

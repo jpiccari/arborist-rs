@@ -62,6 +62,10 @@ struct Args {
     #[arg(short, long)]
     verbose: bool,
 
+    /// Use random color selection instead of deterministic
+    #[arg(short, long)]
+    random: bool,
+
     /// Command and arguments to execute
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
     command: Vec<String>,
@@ -115,22 +119,32 @@ fn run() -> Result<i32> {
 
     match repo_info {
         None => {
-            // Step 2c: Non-git directory, just run command
+            // Non-git directory, just run command
             verbose!("Not a git repository, running command directly...");
             let exit_code = execute_shell_command(&args.command)?;
             return Ok(exit_code);
         }
-        Some(repo) if repo.is_bare => {
-            // Step 2a: Bare repository, use worktrees
-            verbose!("Bare repository detected");
-            verbose!("Repository: {}", repo.root.display());
-            verbose!("Branch: {}", repo.current_branch);
+        Some(repo) => {
+            // Both bare and non-bare repos now use worktrees
+            let is_bare = repo.is_bare;
 
-            let color = select_color();
-            let worktree_path = repo
-                .root
-                .join("worktrees")
-                .join(format!("arborist-{}", &color));
+            verbose!(
+                "{} repository detected",
+                if is_bare { "Bare" } else { "Normal" }
+            );
+            verbose!("Repository: {}", repo.root.display());
+            verbose!("Current branch: {}", repo.current_branch);
+
+            let color = select_color(args.random);
+
+            // Compute worktree path based on repository type
+            let worktree_path = if is_bare {
+                // Bare: {repo_root}/arborist-{color}
+                repo.root.join(format!("arborist-{}", &color))
+            } else {
+                // Non-bare: /tmp/arborist/{sha256}/{color}
+                git::compute_nonbare_worktree_path(&repo.root, &color)?
+            };
 
             verbose!("Preparing worktree at: {}", worktree_path.display());
 
@@ -140,7 +154,7 @@ fn run() -> Result<i32> {
             }
 
             let branch_name = format!("arborist/{}", color);
-            verbose!("Creating new worktree with branch '{}'...", branch_name);
+            verbose!("Creating worktree with branch '{}'...", branch_name);
             git::create_worktree(
                 &worktree_path,
                 &branch_name,
@@ -149,13 +163,13 @@ fn run() -> Result<i32> {
             )?;
 
             // Change to worktree directory
-            let prev_path = DirectoryGuard::with_path(&worktree_path)?;
+            let _prev_path = DirectoryGuard::with_path(&worktree_path)?;
             verbose!("Changed to worktree directory");
 
             // Execute user command
             let exit_code = execute_shell_command(&args.command)?;
 
-            // Step 3: Cleanup
+            // Cleanup
             verbose!("Checking worktree status...");
             let status = git::get_worktree_status()?;
 
@@ -168,58 +182,9 @@ fn run() -> Result<i32> {
             } else {
                 verbose!("No changes detected, removing worktree...");
                 // Return to original directory before removing worktree
-                drop(prev_path);
+                drop(_prev_path);
                 git::remove_worktree_and_branch(&worktree_path, &branch_name)?;
                 verbose!("Worktree and branch removed");
-            }
-
-            Ok(exit_code)
-        }
-        Some(repo) => {
-            // Step 2b: Normal repository, use branches
-            verbose!("Normal repository detected");
-            verbose!("Repository: {}", repo.root.display());
-            verbose!("Current branch: {}", repo.current_branch);
-
-            let color = select_color();
-            let branch_name = format!("arborist/{}", color);
-
-            verbose!("Preparing branch '{}'...", branch_name);
-
-            // Check if branch exists
-            if git::branch_exists(&branch_name)? {
-                verbose!("Branch already exists, checking out...");
-                git::checkout_branch(&branch_name)?;
-            } else {
-                verbose!("Creating new branch...");
-                git::create_branch(&branch_name, &repo.current_commit)?;
-            }
-
-            // Execute user command (stay in current directory)
-            let exit_code = execute_shell_command(&args.command)?;
-
-            // Step 3: Cleanup
-            verbose!("Checking branch status...");
-            let status = git::get_worktree_status()?;
-
-            if status.has_changes {
-                verbose!(
-                    "Note: Uncommitted changes exist in branch '{}'",
-                    branch_name
-                );
-                verbose!("Keeping branch (remember to switch back manually)");
-            } else if status.commits_ahead > 0 {
-                verbose!(
-                    "Note: {} unpushed commit(s) exist in branch '{}'",
-                    status.commits_ahead,
-                    branch_name
-                );
-                verbose!("Keeping branch (remember to switch back manually)");
-            } else {
-                verbose!("No changes detected, returning to original branch...");
-                git::checkout_branch(&repo.current_branch)?;
-                verbose!("Deleting branch '{}'...", branch_name);
-                git::delete_branch(&branch_name)?;
             }
 
             Ok(exit_code)
@@ -243,11 +208,34 @@ fn execute_shell_command(command_args: &[String]) -> Result<i32> {
     Ok(exit_code)
 }
 
-// Select a random color from the palette
-fn select_color() -> String {
+// Select a color based on mode (random or deterministic)
+fn select_color(use_random: bool) -> String {
+    if use_random {
+        select_color_random()
+    } else {
+        select_color_deterministic()
+    }
+}
+
+// Random color selection (works on all platforms)
+fn select_color_random() -> String {
     let mut rng = rand::rng();
     COLORS
         .choose(&mut rng)
         .expect("Color palette should not be empty")
         .to_string()
+}
+
+// Deterministic color selection based on parent process ID (Unix only)
+#[cfg(unix)]
+fn select_color_deterministic() -> String {
+    let parent_pid = std::os::unix::process::parent_id();
+    let index = (parent_pid as usize) % COLORS.len();
+    COLORS[index].to_string()
+}
+
+// Fallback to random selection on non-Unix platforms
+#[cfg(not(unix))]
+fn select_color_deterministic() -> String {
+    select_color_random()
 }
